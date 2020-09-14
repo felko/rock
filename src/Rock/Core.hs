@@ -56,23 +56,25 @@ import qualified Rock.Traces as Traces
 -------------------------------------------------------------------------------
 -- * Types
 
--- | A function which, given an @f@ query, returns a 'Task' allowed to make @f@
--- queries to compute its result.
-type Rules m f = GenRules m f f
+-- | A function which, given an @f@ query, returns a 'TaskT' allowed to make @f@
+-- queries to compute its result in the @m@ monad.
+type Rules f m = GenRules f f m
 
--- | A function which, given an @f@ query, returns a 'Task' allowed to make @g@
--- queries to compute its result.
-type GenRules m f g = forall a. f a -> Task m g a
+-- | A function which, given an @f@ query, returns a 'TaskT' allowed to make @g@
+-- queries to compute its result in the @m@ monad.
+type GenRules f g m = forall a. f a -> TaskT g m a
 
--- | An @IO@ action that is allowed to make @f@ queries using the 'fetch'
+-- | An @m@ action that is allowed to make @f@ queries using the 'fetch'
 -- method from its 'MonadFetch' instance.
-newtype Task m f a = Task { unTask :: ReaderT (Fetch m f) m a }
+newtype TaskT f m a = TaskT { unTask :: ReaderT (Fetch f m) m a }
   deriving
     (Functor, Applicative, Monad, MonadIO)
 
-deriving instance MonadBase IO m => MonadBase IO (Task m f)
+type Task f a = TaskT f IO a
 
-newtype Fetch m f = Fetch (forall a. f a -> m a)
+deriving instance MonadBase b m => MonadBase b (TaskT f m)
+
+newtype Fetch f m = Fetch (forall a. f a -> m a)
 
 -------------------------------------------------------------------------------
 -- * Fetch class
@@ -101,25 +103,28 @@ instance (Monoid w, MonadFetch f m) => MonadFetch f (Lazy.WriterT w m)
 -------------------------------------------------------------------------------
 -- Instances
 
-instance Monad m => MonadFetch f (Task m f) where
+instance Monad m => MonadFetch f (TaskT f m) where
   {-# INLINE fetch #-}
-  fetch key = Task $ lift =<< asks (\(Fetch fetch_) -> fetch_ key)
+  fetch key = TaskT $ lift =<< asks (\(Fetch fetch_) -> fetch_ key)
 
-instance MonadBaseControl IO m => MonadBaseControl IO (Task m f) where
-  type StM (Task m f) a = StM (ReaderT (Fetch m f) m) a
-  liftBaseWith k = Task $ liftBaseWith $ \ma -> k $ ma . unTask
-  restoreM = Task . restoreM
+instance MonadTrans (TaskT f) where
+  lift = TaskT . lift
+
+instance MonadBaseControl IO m => MonadBaseControl IO (TaskT f m) where
+  type StM (TaskT f m) a = StM (ReaderT (Fetch f m) m) a
+  liftBaseWith k = TaskT $ liftBaseWith $ \ma -> k $ ma . unTask
+  restoreM = TaskT . restoreM
 
 -------------------------------------------------------------------------------
 -- * Transformations
 
 -- | Transform the type of queries that a 'Task' performs.
 transFetch
-  :: (forall b. f b -> Task m f' b)
-  -> Task m f a
-  -> Task m f' a
-transFetch f (Task task) =
-  Task $ ReaderT $ \fetch_ ->
+  :: (forall b. f b -> TaskT f' m b)
+  -> TaskT f m a
+  -> TaskT f' m a
+transFetch f (TaskT task) =
+  TaskT $ ReaderT $ \fetch_ ->
     runReaderT task $ Fetch $ \key ->
       runReaderT (unTask $ f key) fetch_
 
@@ -128,8 +133,8 @@ transFetch f (Task task) =
 
 -- | Perform a 'Task', fetching dependency queries from the given 'Rules'
 -- function.
-runTask :: Rules m f -> Task m f a -> m a
-runTask rules (Task task) =
+runTask :: Rules f m -> TaskT f m a -> m a
+runTask rules (TaskT task) =
   runReaderT task $ Fetch $ runTask rules . rules
 
 -------------------------------------------------------------------------------
@@ -139,21 +144,21 @@ runTask rules (Task task) =
 track
   :: forall f g m a. (GEq f, Hashable (Some f), MonadIO m)
   => (forall a'. f a' -> a' -> g a')
-  -> Task m f a
-  -> Task m f (a, DHashMap f g)
+  -> TaskT f m a
+  -> TaskT f m (a, DHashMap f g)
 track f =
   trackM $ \key -> pure . f key
 
 -- | Track the query dependencies of a 'Task' in a 'DHashMap'. Monadic version.
 trackM
   :: forall f g m a. (GEq f, Hashable (Some f), MonadIO m)
-  => (forall a'. f a' -> a' -> Task m f (g a'))
-  -> Task m f a
-  -> Task m f (a, DHashMap f g)
+  => (forall a'. f a' -> a' -> TaskT f m (g a'))
+  -> TaskT f m a
+  -> TaskT f m (a, DHashMap f g)
 trackM f task = do
   depsVar <- liftIO $ newIORef mempty
   let
-    record :: f b -> Task m f b
+    record :: f b -> TaskT f m b
     record key = do
       value <- fetch key
       g <- f key value
@@ -172,8 +177,8 @@ memoise
   :: forall f g m
   . (GEq f, Hashable (Some f), MonadIO m)
   => IORef (DHashMap f MVar)
-  -> GenRules m f g
-  -> GenRules m f g
+  -> GenRules f g m
+  -> GenRules f g m
 memoise startedVar rules (key :: f a) = do
   maybeValueVar <- DHashMap.lookup key <$> liftIO (readIORef startedVar)
   case maybeValueVar of
@@ -214,8 +219,8 @@ memoiseWithCycleDetection
   . (Typeable f, GShow f, GEq f, Hashable (Some f), MonadIO m, MonadBaseControl IO m)
   => IORef (DHashMap f MemoEntry)
   -> IORef (HashMap ThreadId ThreadId)
-  -> GenRules m f g
-  -> GenRules m f g
+  -> GenRules f g m
+  -> GenRules f g m
 memoiseWithCycleDetection startedVar depsVar rules =
   rules'
   where
@@ -294,9 +299,9 @@ verifyTraces
   :: forall f dep m
   . (Hashable (Some f), GEq f, Has' Eq f dep, Typeable f, GShow f, MonadIO m, MonadBaseControl IO m)
   => IORef (Traces f dep)
-  -> (forall a. f a -> a -> Task m f (dep a))
-  -> GenRules m (Writer TaskKind f) f
-  -> Rules m f
+  -> (forall a. f a -> a -> TaskT f m (dep a))
+  -> GenRules (Writer TaskKind f) f m
+  -> Rules f m
 verifyTraces tracesVar createDependencyRecord rules key = do
   traces <- liftIO $ readIORef tracesVar
   maybeValue <- case DHashMap.lookup key traces of
@@ -339,9 +344,9 @@ instance GCompare f => GCompare (Writer w f) where
 -- rule in @rules@.
 writer
   :: forall f w g m. Monad m
-  => (forall a. f a -> w -> Task m g ())
-  -> GenRules m (Writer w f) g
-  -> GenRules m f g
+  => (forall a. f a -> w -> TaskT g m ())
+  -> GenRules (Writer w f) g m
+  -> GenRules f g m
 writer write rules key = do
   (res, w) <- rules $ Writer key
   write key w
@@ -352,10 +357,10 @@ writer write rules key = do
 -- result @result@. 
 traceFetch
   :: Monad m
-  => (forall a. f a -> Task m g ())
-  -> (forall a. f a -> a -> Task m g ())
-  -> GenRules m f g
-  -> GenRules m f g
+  => (forall a. f a -> TaskT g m ())
+  -> (forall a. f a -> a -> TaskT g m ())
+  -> GenRules f g m
+  -> GenRules f g m
 traceFetch before after rules key = do
   before key
   result <- rules key
@@ -368,8 +373,8 @@ type ReverseDependencies f = HashMap (Some f) (HashSet (Some f))
 trackReverseDependencies
   :: (GEq f, Hashable (Some f), MonadIO m)
   => IORef (ReverseDependencies f)
-  -> Rules m f
-  -> Rules m f
+  -> Rules f m
+  -> Rules f m
 trackReverseDependencies reverseDepsVar rules key = do
   (res, deps) <- track (\_ _ -> Const ()) $ rules key
   unless (DHashMap.null deps) $ do
